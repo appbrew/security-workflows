@@ -21,8 +21,11 @@ jobs:
   scan:
     if: true
     name: Scan for secrets
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     timeout-minutes: 15
+    outputs:
+      report_state: ${{ steps.report.outputs.state }}
+      report_body: ${{ steps.report.outputs.body }}
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -51,13 +54,183 @@ jobs:
 
       # --validation は付けない。見つけた値を外部の API に送ってしまうため。
       - name: Scan commits added by this change
+        id: scan
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
         run: |
+          scan_status=0
           "$RUNNER_TEMP/betterleaks" git . \
             --config "$RUNNER_TEMP/betterleaks.toml" \
             --log-opts "${BASE_SHA}..${HEAD_SHA}" \
             --platform github \
             --redact \
-            --verbose
+            --verbose \
+            --report-format json \
+            --report-path "$RUNNER_TEMP/betterleaks-findings.json" \
+            --exit-code 10 || scan_status=$?
+          echo "exit_code=$scan_status" >> "$GITHUB_OUTPUT"
+          exit "$scan_status"
+
+      # 共通 workflow のスクリプトを使う。検査対象のリポジトリのコードは実行しない。
+      # 生の JSON には値や周辺情報が含まれ得るため、artifact や job output に渡さない。
+      - name: Prepare safe report
+        id: report
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          SCAN_OUTCOME: ${{ steps.scan.outcome }}
+          SCAN_EXIT_CODE: ${{ steps.scan.outputs.exit_code }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        with:
+          script: |
+            // BEGIN report-renderer
+            const fs = require('node:fs');
+            const path = require('node:path');
+            const runUrl = process.env.GITHUB_SERVER_URL + '/' + process.env.GITHUB_REPOSITORY
+              + '/actions/runs/' + process.env.GITHUB_RUN_ID + '/attempts/' + process.env.GITHUB_RUN_ATTEMPT;
+            const escape = (value) => String(value).replace(/[&<>"'`|\[\]\\*_~@]/g,
+              (char) => '&#' + char.charCodeAt(0) + ';');
+            const encode = (value) => encodeURIComponent(value).replace(/[!'()*]/g,
+              (char) => '%' + char.charCodeAt(0).toString(16));
+            let state = 'error';
+            let findings = [];
+            try {
+              const reportPath = path.join(process.env.RUNNER_TEMP, 'betterleaks-findings.json');
+              if (fs.statSync(reportPath).size > 16 * 1024 * 1024) throw new Error('Report too large');
+              const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+              if (!Array.isArray(report)) throw new Error('Invalid report');
+              findings = report.map((item) => {
+                if (!item || typeof item.File !== 'string' || !item.File || item.File.length > 2048
+                    || /[\x00-\x1f\x7f]/.test(item.File) || item.File.startsWith('/')
+                    || item.File.split('/').includes('..')
+                    || typeof item.Commit !== 'string' || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(item.Commit)
+                    || typeof item.RuleID !== 'string' || !/^[a-zA-Z0-9_-]{1,128}$/.test(item.RuleID)
+                    || !Number.isSafeInteger(item.StartLine) || item.StartLine < 1) {
+                  throw new Error('Invalid finding');
+                }
+                return {
+                  file: item.File, commit: item.Commit, rule: item.RuleID, line: item.StartLine,
+                  fingerprint: [item.Commit, item.File, item.RuleID, item.StartLine].join(':'),
+                };
+              });
+              if (process.env.SCAN_OUTCOME === 'success' && process.env.SCAN_EXIT_CODE === '0' && findings.length === 0) {
+                state = 'clean';
+              } else if (process.env.SCAN_OUTCOME === 'failure' && process.env.SCAN_EXIT_CODE === '10' && findings.length > 0) {
+                state = 'findings';
+              }
+            } catch {
+              core.warning('Betterleaks の検出結果を読み取れませんでした。CI ログを確認してください。');
+            }
+            let body;
+            if (state === 'clean') {
+              body = '### Betterleaks の検査が完了しました\n\n秘密情報の候補は検出されませんでした。';
+            } else if (state === 'error') {
+              body = '### Betterleaks の検査を完了できませんでした\n\n'
+                + '実行エラーが発生したため、検出の有無を判定できません。CI ログを確認し、原因を解消して再実行してください。\n\n'
+                + 'このエラーは `.betterleaksignore` への追記では解消できません。';
+            } else {
+              const rows = [];
+              const fingerprints = [];
+              let bytes = 0;
+              for (const finding of findings) {
+                const url = process.env.GITHUB_SERVER_URL + '/' + process.env.GITHUB_REPOSITORY
+                  + '/blob/' + finding.commit + '/' + finding.file.split('/').map(encode).join('/') + '#L' + finding.line;
+                const row = '| [<code>' + escape(finding.file) + ':' + finding.line + '</code>](' + url + ') | <code>'
+                  + escape(finding.rule) + '</code> | <code>' + finding.commit.slice(0, 7) + '</code> |';
+                const fingerprint = escape(finding.fingerprint);
+                bytes += Buffer.byteLength(row + fingerprint);
+                if (rows.length >= 50 || bytes > 40000) break;
+                rows.push(row);
+                fingerprints.push(fingerprint);
+              }
+              body = '### Betterleaks が秘密情報の候補を ' + findings.length + ' 件検出しました\n\n'
+                + '検出箇所と用途を確認してください。翻訳文言やテスト用の値を誤検知している場合もあります。\n\n'
+                + '| 検出箇所 | ルール | コミット |\n| --- | --- | --- |\n' + rows.join('\n') + '\n\n';
+              if (rows.length < findings.length) {
+                body += '先頭 ' + rows.length + ' 件を表示しています。残りの検出箇所は CI ログで確認してください。\n\n';
+              }
+              body += '#### 誤検知の場合\n\n'
+                + 'リポジトリ直下の `.betterleaksignore` に、誤検知と確認した項目の識別子だけを1行ずつ追記してください。'
+                + '除外理由を PR に記載し、レビューを受けてください。\n\n'
+                + 'ignore の追加は、追加コミットを通常の push で反映できます。コミットの書き換えや force-push は不要です。\n\n'
+                + '<details>\n<summary>検出項目の識別子（誤検知と確認したものだけを追記）</summary>\n\n<pre>'
+                + fingerprints.join('\n') + '</pre>\n</details>\n\n'
+                + '#### 実際の秘密情報の場合\n\n'
+                + 'まず発行元で無効化・ローテーションし、該当コミットから取り除いてください。本物の秘密情報を ignore で除外しないでください。\n\n'
+                + 'PR 内の過去コミットも検査します。後続コミットで値を削除したり、`betterleaks:allow` を追加したりしても、過去の検出は残ります。'
+                + '履歴を書き換える場合は、共同作業者の変更とブランチの保護設定を確認してください。\n\n'
+                + '判断に迷う場合は、値をコメントに貼らずにレビュワーへ確認してください。';
+            }
+            body += '\n\n検査対象: <code>' + escape(process.env.HEAD_SHA || '') + '</code> · [CI の実行結果](' + runUrl + ')';
+            core.setOutput('state', state);
+            core.setOutput('body', body);
+            await core.summary.addRaw(body).write();
+            // END report-renderer
+
+  notify:
+    name: Report scan results
+    needs: scan
+    if: ${{ !cancelled() && github.event_name == 'pull_request' && needs.scan.outputs.report_state != '' }}
+    runs-on: ubuntu-slim
+    timeout-minutes: 5
+    # 通知の失敗で検査の合否を変えない。fork PR 等で書き込めない場合は Summary に残る。
+    continue-on-error: true
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Comment and collapse previous reports
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          REPORT_STATE: ${{ needs.scan.outputs.report_state }}
+          REPORT_BODY: ${{ needs.scan.outputs.report_body }}
+        with:
+          script: |
+            // BEGIN report-publisher
+            const marker = '<!-- betterleaks-report:v1 -->';
+            const state = process.env.REPORT_STATE;
+            if (!['clean', 'findings', 'error'].includes(state) || !process.env.REPORT_BODY) return;
+            const repo = context.repo;
+            const issue_number = context.payload.pull_request.number;
+            const head = context.payload.pull_request.head.sha;
+            const run = BigInt(process.env.GITHUB_RUN_ID);
+            const attempt = BigInt(process.env.GITHUB_RUN_ATTEMPT);
+            const isCurrent = async () => {
+              const { data: pr } = await github.rest.pulls.get({ ...repo, pull_number: issue_number });
+              return pr.state === 'open' && pr.head.sha === head;
+            };
+            try {
+              if (!await isCurrent()) return;
+              const comments = await github.paginate(github.rest.issues.listComments, { ...repo, issue_number, per_page: 100 });
+              const reports = comments.filter((comment) => comment.user?.type === 'Bot'
+                && comment.user.login === 'github-actions[bot]' && comment.body?.startsWith(marker))
+                .map((comment) => {
+                  const match = comment.body.match(/<!-- betterleaks-run:(\d+):(\d+) -->/);
+                  return match ? { ...comment, run: BigInt(match[1]), attempt: BigInt(match[2]) } : null;
+                }).filter(Boolean);
+              if (reports.some((comment) => comment.run > run || (comment.run === run && comment.attempt > attempt))) return;
+              const sameRun = reports.find((comment) => comment.run === run && comment.attempt === attempt);
+              if (!await isCurrent()) return;
+              if (state !== 'clean' && !sameRun) {
+                const body = marker + '\n<!-- betterleaks-run:' + run + ':' + attempt + ' -->\n' + process.env.REPORT_BODY;
+                // 新しい案内を投稿できた後に、前のコメントを折りたたむ。
+                await github.rest.issues.createComment({ ...repo, issue_number, body });
+              }
+              for (const comment of reports) {
+                if (state !== 'clean' && comment.id === sameRun?.id) continue;
+                if (!await isCurrent()) return;
+                try {
+                  await github.graphql(`mutation($id: ID!, $classifier: ReportedContentClassifiers!) {
+                    minimizeComment(input: {subjectId: $id, classifier: $classifier}) {
+                      minimizedComment { isMinimized }
+                    }
+                  }`, { id: comment.node_id, classifier: state === 'clean' ? 'RESOLVED' : 'OUTDATED' });
+                } catch {
+                  core.warning('前回の Betterleaks コメントを折りたためませんでした。');
+                }
+              }
+            } catch {
+              core.warning('PR コメントを投稿・更新できませんでした。検出箇所と対処方法は Scan for secrets の Summary で確認できます。');
+            }
+            // END report-publisher
