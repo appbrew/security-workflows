@@ -18,6 +18,112 @@ env:
   BETTERLEAKS_SHA256: f8b185a39ffcece2a1ca82bf3a4e7435cd81963ffd16b7a9128daf75f35f6de7
 
 jobs:
+  # Betterleaks はバイナリのファイルを読み飛ばすので、証明書や鍵ストアは拡張子で検出する。
+  key-files:
+    if: true
+    name: Check for key files
+    runs-on: ubuntu-slim
+    timeout-minutes: 10
+    steps:
+      # 要るのはファイル名の一覧と除外ファイルだけなので、sparse checkout にしてファイルの中身を取得しない。
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          fetch-depth: 0
+          sparse-checkout: |
+            /.betterleaksignore
+            /.gitleaksignore
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Check added key and certificate files
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        with:
+          script: |
+            // BEGIN key-file-check
+            const fs = require('node:fs');
+            const { execFileSync } = require('node:child_process');
+            const rule = 'binary-key-file';
+            const keyFile = /\.(?:p12|pfx|pkcs12|jks|keystore|bks|jceks)$/i;
+            const sha = /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/;
+            const escape = (value) => String(value).replace(/[&<>"'`|\[\]\\*_~@]/g,
+              (char) => '&#' + char.charCodeAt(0) + ';');
+            // ファイルの中身が要る操作で、リモートへ取りに行かないようにする。
+            const git = (args) => execFileSync('git', args, {
+              encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+              env: { ...process.env, GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0' },
+            });
+            const found = [];
+            const ignored = new Set();
+            try {
+              const base = process.env.BASE_SHA;
+              const head = process.env.HEAD_SHA;
+              if (!sha.test(base) || !sha.test(head)) throw new Error('Invalid base or head');
+              // PR 内の各コミットを見る。後のコミットで消しても、追加したコミットは GitHub に残るため。
+              for (const commit of git(['rev-list', '--no-merges', base + '..' + head]).split('\n').filter(Boolean)) {
+                if (!sha.test(commit)) throw new Error('Invalid commit');
+                const files = git(['diff-tree', '--root', '-r', '--no-commit-id', '--no-renames',
+                  '--diff-filter=AM', '--name-only', '-z', commit]).split('\0').filter(Boolean);
+                for (const file of files) {
+                  if (keyFile.test(file)) found.push({ commit, file });
+                }
+              }
+              // Betterleaks と同じ順で除外ファイルを探す。
+              const ignoreFile = ['.betterleaksignore', '.gitleaksignore'].find((name) => fs.existsSync(name));
+              if (ignoreFile) {
+                const stat = fs.lstatSync(ignoreFile);
+                if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error('Invalid ignore file');
+                for (const line of fs.readFileSync(ignoreFile, 'utf8').split(/\r?\n/)) {
+                  const entry = line.trim();
+                  if (entry && !entry.startsWith('#')) ignored.add(entry);
+                }
+              }
+            } catch (error) {
+              core.setFailed('鍵や証明書のファイルの検査を完了できませんでした。CI ログを確認して再実行してください。（'
+                + String(error.message).slice(0, 500) + '）');
+              return;
+            }
+            // 除外はコミットごとに書く。同じパスのファイルを後で本物の鍵に差し替えても、検出されるようにするため。
+            const fingerprint = (item) => [item.commit, item.file, rule, 0].join(':');
+            const remaining = found.filter((item) => !ignored.has(fingerprint(item)));
+            if (remaining.length === 0) return;
+            core.setFailed('鍵や証明書のファイルが ' + remaining.length + ' 件見つかりました。対処方法は Summary を確認してください。');
+            const rows = [];
+            const fingerprints = [];
+            let bytes = 0;
+            for (const item of remaining) {
+              const row = '| <code>' + escape(item.file) + '</code> | <code>' + item.commit.slice(0, 7) + '</code> |';
+              const entry = escape(fingerprint(item));
+              bytes += Buffer.byteLength(row + entry);
+              if (rows.length >= 50 || bytes > 40000) break;
+              core.error('鍵や証明書のファイルが追加・変更されています: ' + item.file, { title: 'Key or certificate file', file: item.file });
+              rows.push(row);
+              fingerprints.push(entry);
+            }
+            let body = '### 鍵や証明書のファイルが ' + remaining.length + ' 件見つかりました\n\n'
+              + '証明書や鍵ストアのファイル（.p12、.pfx、.jks、.keystore など）は、中身を Betterleaks で検査できないため、拡張子で検出しています。\n\n'
+              + '| ファイル | コミット |\n| --- | --- |\n' + rows.join('\n') + '\n\n';
+            if (rows.length < remaining.length) {
+              body += '先頭 ' + rows.length + ' 件を表示しています。\n\n';
+            }
+            body += '#### 本物の鍵や証明書の場合\n\n'
+              + 'まず発行元で失効・再発行し、該当コミットから取り除いてください。コミットから消すだけでは足りません。push した時点で GitHub に届いているためです。\n\n'
+              + 'PR 内の過去コミットも検査します。後続コミットでファイルを削除しても、過去の検出は残ります。\n\n'
+              + '#### リポジトリに置いてよいファイルの場合\n\n'
+              + '開発用の署名鍵のように公開してよいファイルなら、リポジトリ直下の `.betterleaksignore` に、次の識別子を1行ずつ追記してください。'
+              + '除外理由を PR に記載し、レビューを受けてください。\n\n'
+              + '<pre>' + fingerprints.join('\n') + '</pre>';
+            try {
+              await core.summary.addRaw(body).write();
+            } catch {
+              core.warning('Summary を書き込めませんでした。検出箇所はこのステップのエラー表示で確認してください。');
+            }
+            // END key-file-check
+
   scan:
     if: true
     name: Scan for secrets
